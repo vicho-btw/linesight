@@ -94,7 +94,11 @@ def launch_game(tmi_port):
             tm_processes = list(
                 filter(
                     lambda s: s.startswith("TmForever"),
-                    subprocess.check_output("wmic process get Caption,ParentProcessId,ProcessId").decode().split("\r\n"),
+                    subprocess.check_output(
+                        # wmic was removed in recent Windows versions (see game_instance_manager.py)
+                        ["powershell", "-Command", 'Get-CimInstance Win32_Process | ForEach-Object { "$($_.Name) $($_.ParentProcessId) $($_.ProcessId)" }'],
+                        text=True,
+                    ).splitlines(),
                 )
             )
             for process in tm_processes:

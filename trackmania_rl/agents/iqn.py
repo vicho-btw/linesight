@@ -7,6 +7,7 @@ In this file, we define:
 
 import copy
 import math
+from pathlib import Path
 import random
 from typing import Optional, Tuple
 
@@ -17,6 +18,7 @@ from torchrl.data import ReplayBuffer
 
 from config_files import config_copy
 from trackmania_rl import utilities
+from trackmania_rl.agents.flybrain import FlyBrain
 
 
 class IQN_Network(torch.nn.Module):
@@ -53,7 +55,32 @@ class IQN_Network(torch.nn.Module):
             activation_function(inplace=True),
         )
 
-        dense_input_dimension = conv_head_output_dim + float_hidden_dim
+        # The connectome trunk, if enabled, replaces the plain concatenation of the two input
+        # heads. It runs *before* the IQN quantile expansion, so it sees `batch_size` samples
+        # rather than `batch_size * num_quantiles` -- an 8x saving that is what makes a
+        # 139k-neuron recurrent brain affordable here. The quantile machinery is distributional-RL
+        # bookkeeping, not part of the animal, so there is no reason for the brain to see it.
+        self.use_fly_brain = getattr(config_copy, "use_fly_brain", False)
+        if self.use_fly_brain:
+            self.fly_brain = FlyBrain(
+                connectome_path=config_copy.fly_connectome_path,
+                visual_channels=config_copy.fly_visual_channels,
+                visual_h=config_copy.fly_visual_h,
+                visual_w=config_copy.fly_visual_w,
+                float_dim=float_hidden_dim,
+                readout_dim=config_copy.fly_readout_dim,
+                n_settle_steps=config_copy.fly_n_settle_steps,
+                sensory_rank=config_copy.fly_sensory_rank,
+                init_gain=config_copy.fly_init_gain,
+                dale=config_copy.fly_dale,
+                step_norm=config_copy.fly_step_norm,
+                dt_ms=config_copy.fly_dt_ms,
+                membrane_tau_ms=config_copy.fly_membrane_tau_ms,
+            )
+            dense_input_dimension = config_copy.fly_readout_dim
+        else:
+            self.fly_brain = None
+            dense_input_dimension = conv_head_output_dim + float_hidden_dim
 
         self.A_head = torch.nn.Sequential(
             torch.nn.Linear(dense_input_dimension, dense_hidden_dimension // 2),
@@ -119,7 +146,12 @@ class IQN_Network(torch.nn.Module):
         batch_size = img.shape[0]
         img_outputs = self.img_head(img)
         float_outputs = self.float_feature_extractor((float_inputs - self.float_inputs_mean) / self.float_inputs_std)
-        concat = torch.cat((img_outputs, float_outputs), 1)  # (batch_size, dense_input_dimension)
+        if self.fly_brain is not None:
+            # img_outputs is the flattened (32, 11, 16) retinotopic feature map; the brain
+            # re-reads it columnwise, so no reshape is needed here.
+            concat = self.fly_brain(img_outputs, float_outputs)  # (batch_size, dense_input_dimension)
+        else:
+            concat = torch.cat((img_outputs, float_outputs), 1)  # (batch_size, dense_input_dimension)
         if tau is None:
             tau = (
                 torch.arange(num_quantiles // 2, device="cuda", dtype=torch.float32).repeat_interleave(batch_size).unsqueeze(1)
@@ -144,6 +176,10 @@ class IQN_Network(torch.nn.Module):
         V = self.V_head(concat)  # (batch_size*num_quantiles, 1)
 
         Q = V + A - A.mean(dim=-1).unsqueeze(-1)
+
+        if self.fly_brain is not None and self.fly_brain.live_tap is not None and batch_size == 1:
+            # Averaged over quantiles: what the brain currently wants to do.
+            self.fly_brain.live_tap.publish_q(Q.detach().mean(dim=0).tolist())
 
         return Q, tau
 
@@ -190,6 +226,9 @@ class Trainer:
         "iqn_n",
         "typical_self_loss",
         "typical_clamped_self_loss",
+        "reference_network",
+        "reference_mtime",
+        "reference_checks",
     )
 
     def __init__(
@@ -205,6 +244,28 @@ class Trainer:
         self.target_network = target_network
         self.optimizer = optimizer
         self.scaler = scaler
+
+        # Frozen copy of the policy this run was distilled from. The KL term below keeps
+        # fine-tuning from wandering away from it without earning the departure.
+        self.reference_network = None
+        self.reference_mtime = 0.0
+        self.reference_checks = 0
+        if getattr(config_copy, "kl_anchor_weight", 0.0) > 0:
+            try:
+                ref_path = Path(__file__).resolve().parents[2] / "save" / config_copy.kl_anchor_run / "weights1.torch"
+                ref, _ = make_untrained_iqn_network(jit=False, is_inference=True)
+                ref.load_state_dict(torch.load(f=ref_path, weights_only=False))
+                ref.eval()
+                for prm in ref.parameters():
+                    prm.requires_grad_(False)
+                self.reference_network = ref
+                try:
+                    self.reference_mtime = ref_path.stat().st_mtime
+                except OSError:
+                    pass
+                print(f"KL anchor active: reference = {ref_path}", flush=True)
+            except Exception as e:
+                print(f"KL anchor disabled, could not load reference: {e}", flush=True)
         self.batch_size = batch_size
         self.iqn_n = iqn_n
         self.typical_self_loss = 0.01
@@ -316,6 +377,42 @@ class Trainer:
             loss *= self.typical_clamped_self_loss / correction_clamped
 
             total_loss = torch.sum(IS_weights * loss if config_copy.prio_alpha > 0 else loss)
+
+            # --- KL anchor -------------------------------------------------------------
+            # Penalise divergence from the distilled policy, measured as a KL between the two
+            # softened action distributions. total_loss is a SUM over the batch, so the
+            # batch-mean KL is scaled by batch_size to keep the weight interpretable.
+            kl_w = getattr(config_copy, "kl_anchor_weight", 0.0)
+
+            # The anchor is a ratchet: whenever a faster policy is saved, it becomes the new
+            # reference, so every departure is judged against the best lap achieved so far
+            # rather than against a fixed starting point.
+            if self.reference_network is not None and kl_w > 0:
+                self.reference_checks += 1
+                if self.reference_checks % getattr(config_copy, "kl_anchor_reload_every", 400) == 0:
+                    try:
+                        rp = Path(__file__).resolve().parents[2] / "save" / config_copy.kl_anchor_run / "weights1.torch"
+                        m = rp.stat().st_mtime
+                        if m > self.reference_mtime:
+                            self.reference_network.load_state_dict(torch.load(f=rp, weights_only=False))
+                            self.reference_network.eval()
+                            self.reference_mtime = m
+                            print(f"KL anchor advanced to a newer best ({rp})", flush=True)
+                    except Exception as e:
+                        print(f"anchor reload skipped: {e}", flush=True)
+            if self.reference_network is not None and kl_w > 0:
+                with torch.no_grad():
+                    nq = getattr(config_copy, "kl_anchor_quantiles", 8)
+                    q_ref, _ = self.reference_network(state_img_tensor, state_float_tensor, nq, tau=None)
+                    q_ref = q_ref.reshape([nq, self.batch_size, -1]).mean(dim=0)
+                q_online = q__st__online__quantiles_tau3.reshape([self.iqn_n, self.batch_size, -1]).mean(dim=0)
+                T = getattr(config_copy, "kl_anchor_temp", 0.05)
+                kl = torch.nn.functional.kl_div(
+                    torch.log_softmax(q_online.float() / T, dim=1),
+                    torch.softmax(q_ref.float() / T, dim=1),
+                    reduction="batchmean",
+                )
+                total_loss = total_loss + kl_w * self.batch_size * kl
 
             if do_learn:
                 self.scaler.scale(total_loss).backward()
@@ -458,6 +555,11 @@ def make_untrained_iqn_network(jit: bool, is_inference: bool) -> Tuple[IQN_Netwo
         float_inputs_mean=config_copy.float_inputs_mean,
         float_inputs_std=config_copy.float_inputs_std,
     )
+    if jit and getattr(config_copy, "use_fly_brain", False):
+        # TorchScript cannot trace sparse COO construction, and the recurrent settle loop
+        # defeats torch.compile's static shapes. The connectome runs eager.
+        print("use_fly_brain is set: disabling jit for the connectome network.")
+        jit = False
     if jit:
         if config_copy.is_linux:
             compile_mode = None if "rocm" in torch.__version__ else ("max-autotune" if is_inference else "max-autotune-no-cudagraphs")

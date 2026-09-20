@@ -3,6 +3,7 @@ This file implements a single multithreaded worker that handles a Trackmania gam
 """
 
 import importlib
+import traceback
 import time
 from itertools import chain, count, cycle
 from pathlib import Path
@@ -49,6 +50,19 @@ def collector_process_fn(
         print("Worker could not load weights, exception:", e)
 
     inferer = iqn.Inferer(inference_network, config_copy.iqn_k, config_copy.tau_epsilon_boltzmann)
+
+    # Live activity tap, worker 0 only: two workers writing one mmap would interleave frames.
+    if getattr(config_copy, "fly_live_tap", False) and process_number == 0:
+        brain = getattr(uncompiled_inference_network, "fly_brain", None)
+        if brain is not None:
+            brain.enable_live_tap(
+                config_copy.fly_live_tap_path,
+                n_actions=len(config_copy.inputs),
+                every=config_copy.fly_live_tap_every,
+            )
+        target = getattr(inference_network, "fly_brain", None)
+        if target is not None and target is not brain:
+            target.live_tap = brain.live_tap if brain is not None else None
 
     def update_network():
         # Update weights of the inference network
@@ -118,12 +132,31 @@ def collector_process_fn(
         update_network()
 
         rollout_start_time = time.perf_counter()
-        rollout_results, end_race_stats = tmi.rollout(
-            exploration_policy=inferer.get_exploration_action,
-            map_path=map_path,
-            zone_centers=zone_centers,
-            update_network=update_network,
-        )
+        try:
+            rollout_results, end_race_stats = tmi.rollout(
+                exploration_policy=inferer.get_exploration_action,
+                map_path=map_path,
+                zone_centers=zone_centers,
+                update_network=update_network,
+                # Only exploratory rollouts may start mid-lap. Eval laps stay end-to-end so the
+                # lap times they report remain comparable with every earlier measurement.
+                exploring_starts=is_explo,
+            )
+        except Exception:
+            # An unattended run has to survive transient game and OS failures: a dropped
+            # TMInterface socket, a window operation the OS refuses, a game crash. Without this
+            # the worker process exits on the first such failure and the learner then starves
+            # forever while the run looks alive. Discard the rollout, restart the game, carry on.
+            traceback.print_exc()
+            print("Rollout crashed; restarting this game instance and continuing.", flush=True)
+            try:
+                tmi.close_game()
+            except Exception:
+                pass
+            tmi.iface = None
+            tmi.last_rollout_crashed = True
+            time.sleep(5)
+            continue
         rollout_end_time = time.perf_counter()
         rollout_duration = rollout_end_time - rollout_start_time
         rollout_results["worker_time_in_rollout_percentage"] = rollout_duration / (time.perf_counter() - time_since_last_queue_push)

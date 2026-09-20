@@ -23,13 +23,14 @@ Contributions are welcome to simplify this part of the code.
 
 import math
 import os
+import random
 import socket
 import subprocess
 import time
 from typing import Callable, Dict, List
 
 import cv2
-import numba
+from trackmania_rl.numba_compat import njit
 import numpy as np
 import numpy.typing as npt
 import psutil
@@ -42,6 +43,7 @@ if config_copy.is_linux:
     from xdo import Xdo
 else:
     import win32.lib.win32con as win32con
+    import win32api
     import win32com.client
     import win32gui
     import win32process
@@ -49,25 +51,78 @@ else:
 
 def _set_window_focus(trackmania_window):
     # https://stackoverflow.com/questions/14295337/win32gui-setactivewindow-error-the-specified-procedure-could-not-be-found
+    #
+    # Best-effort only. Windows refuses SetForegroundWindow whenever another process owns the
+    # foreground, which is to say whenever somebody is actually using the machine, and it
+    # raises pywintypes.error when it does. Nothing in the rollout needs focus: frames arrive
+    # over the TMInterface socket via get_frame(), and inputs are applied through
+    # set_input_state(). Focus is only nudged once per rollout because ModLoader wants the
+    # window activated at least once. Losing that nudge is not worth killing a training run
+    # that may have been collecting for hours.
     if config_copy.is_linux:
-        Xdo().activate_window(trackmania_window)
+        try:
+            Xdo().activate_window(trackmania_window)
+        except Exception as e:
+            print(f"Could not focus game window (continuing): {e}", flush=True)
     else:
-        shell = win32com.client.Dispatch("WScript.Shell")
-        shell.SendKeys("%")
-        win32gui.SetForegroundWindow(trackmania_window)
+        try:
+            shell = win32com.client.Dispatch("WScript.Shell")
+            shell.SendKeys("%")
+            win32gui.SetForegroundWindow(trackmania_window)
+        except Exception as e:
+            print(f"Could not focus game window (continuing): {e}", flush=True)
+            try:
+                win32gui.ShowWindow(trackmania_window, win32con.SW_SHOWNORMAL)
+            except Exception:
+                pass
+
+
+
+def _dismiss_profile_dialog(trackmania_window):
+    """
+    Click past TmForever's "Select your Profile" dialog.
+
+    The plugin only accepts and answers connections from inside Render(), and when the game
+    is still in GameState::StartUp it *queues* the handshake until the game reaches Menus.
+    A profile dialog therefore deadlocks a run silently and forever: the socket connects, the
+    client waits for a handshake that is never sent, and every rollout dies on a TMI timeout
+    with no error to show for it. The dialog appears after the game is killed uncleanly,
+    which a supervisor does routinely.
+
+    The click lands on the profile entry while the dialog is up. If the game has already got
+    itself to the main menu, the same point is empty background (the menu items are down the
+    left edge), so this is safe either way.
+    """
+    if config_copy.is_linux:
+        return
+    try:
+        rect = win32gui.GetWindowRect(trackmania_window)
+        x, y = rect[0] + 320, rect[1] + 155
+        for _ in range(2):
+            win32api.SetCursorPos((x, y))
+            time.sleep(0.15)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            time.sleep(0.4)
+    except Exception as e:
+        print(f"Could not dismiss profile dialog (continuing): {e}", flush=True)
 
 
 def ensure_not_minimized(trackmania_window):
-    if config_copy.is_linux:
-        Xdo().map_window(trackmania_window)
-    else:
-        if win32gui.IsIconic(
-            trackmania_window
-        ):  # https://stackoverflow.com/questions/54560987/restore-window-without-setting-to-foreground
-            win32gui.ShowWindow(trackmania_window, win32con.SW_SHOWNORMAL)  # Unminimize window
+    # Also best-effort, for the same reason as _set_window_focus.
+    try:
+        if config_copy.is_linux:
+            Xdo().map_window(trackmania_window)
+        else:
+            if win32gui.IsIconic(
+                trackmania_window
+            ):  # https://stackoverflow.com/questions/54560987/restore-window-without-setting-to-foreground
+                win32gui.ShowWindow(trackmania_window, win32con.SW_SHOWNORMAL)  # Unminimize window
+    except Exception as e:
+        print(f"Could not unminimize game window (continuing): {e}", flush=True)
 
 
-@numba.njit
+@njit
 def update_current_zone_idx(
     current_zone_idx: int,
     zone_centers: npt.NDArray,
@@ -126,8 +181,29 @@ class GameInstanceManager:
         self.tm_process_id = None
         self.tm_window_id = None
         self.start_states = {}
+        # map_path -> {bucket: (simulation_state, zone_idx)}: states banked partway round a lap,
+        # used as exploring starts. bucket -> float: recent failures, which bias the sampling.
+        self.zone_states = {}
+        self.zone_failures = {}
         self.game_spawning_lock = game_spawning_lock
         self.game_activated = False
+
+    def _pick_exploring_start(self, map_path: str):
+        """A banked mid-lap state, drawn more often from sections where laps recently died."""
+        bank = self.zone_states.get(map_path)
+        if not bank:
+            return None
+        buckets = sorted(bank)
+        weights = [1.0 + self.zone_failures.get(b, 0.0) for b in buckets]
+        total = sum(weights)
+        if total <= 0:
+            return None
+        r = random.random() * total
+        for b, w in zip(buckets, weights):
+            r -= w
+            if r <= 0:
+                return bank[b]
+        return bank[buckets[-1]]
 
     def get_tm_window_id(self):
         assert self.tm_process_id is not None
@@ -239,6 +315,10 @@ class GameInstanceManager:
 
         self.get_tm_window_id()
 
+        # Give the game a moment to put its profile dialog up, then click past it.
+        time.sleep(6)
+        _dismiss_profile_dialog(self.tm_window_id)
+
     def is_game_running(self):
         return (self.tm_process_id is not None) and (self.tm_process_id in (p.pid for p in psutil.process_iter()))
 
@@ -282,7 +362,14 @@ class GameInstanceManager:
             self.max_allowable_distance_to_real_checkpoint,
         ) = map_loader.sync_virtual_and_real_checkpoints(zone_centers, map_path)
 
-    def rollout(self, exploration_policy: Callable, map_path: str, zone_centers: npt.NDArray, update_network: Callable):
+    def rollout(
+        self,
+        exploration_policy: Callable,
+        map_path: str,
+        zone_centers: npt.NDArray,
+        update_network: Callable,
+        exploring_starts: bool = False,
+    ):
         (
             zone_transitions,
             distance_between_zone_transitions,
@@ -291,6 +378,10 @@ class GameInstanceManager:
         ) = map_loader.precalculate_virtual_checkpoints_information(zone_centers)
 
         self.ensure_game_launched()
+        # A minimized TmForever stops rendering and stops answering TMInterface, so every
+        # rollout on it times out. Restore before starting, not only midway through the loop.
+        if self.tm_window_id is not None:
+            ensure_not_minimized(self.tm_window_id)
         if time.perf_counter() - self.last_game_reboot > config_copy.game_reboot_interval:
             self.close_game()
             self.iface = None
@@ -319,10 +410,21 @@ class GameInstanceManager:
             "q_values": [],
             "meters_advanced_along_centerline": [],
             "state_float": [],
+            # SceneVehicleCar.has_any_lateral_contact is TMInterface's own flag for the car BODY
+            # touching something sideways -- a wall hit. It is exact, unlike inferring impacts
+            # from speed drops, which cannot tell a wall from hard braking. Kept out of
+            # state_float on purpose: these are bookkeeping for the reward, and changing the
+            # network's input dimension would invalidate every trained checkpoint.
+            "has_lateral_contact": [],
+            "last_contact_time": [],
             "furthest_zone_idx": 0,
         }
 
         last_progress_improvement_ms = 0
+        exploring_start_zone = None
+        buckets_banked_this_rollout = set()
+        n_start_buckets = getattr(config_copy, "exploring_starts_n_buckets", 0)
+        n_zones_total = max(len(zone_centers), 1)
 
         if (self.iface is None) or (not self.iface.registered):
             assert self.msgtype_response_to_wakeup_TMI is None
@@ -430,7 +532,23 @@ class GameInstanceManager:
                         last_progress_improvement_ms = sim_state_race_time
                         rollout_results["furthest_zone_idx"] = current_zone_idx
 
+                        # Bank this state as a candidate exploring start. Only laps that began at
+                        # the start line contribute, and only at moments of forward progress, so
+                        # the bank holds states on a clean line rather than ones where the car was
+                        # already stuck. First entry into each section wins, so the banked state
+                        # sits at the section boundary.
+                        if exploring_start_zone is None and last_known_simulation_state is not None and n_start_buckets > 0:
+                            bucket = int(current_zone_idx * n_start_buckets / n_zones_total)
+                            if 0 < bucket < n_start_buckets and bucket not in buckets_banked_this_rollout:
+                                buckets_banked_this_rollout.add(bucket)
+                                self.zone_states.setdefault(map_path, {})[bucket] = (
+                                    last_known_simulation_state,
+                                    current_zone_idx,
+                                )
+
                     rollout_results["current_zone_idx"].append(current_zone_idx)
+                    rollout_results["has_lateral_contact"].append(bool(sim_state_mobil.has_any_lateral_contact))
+                    rollout_results["last_contact_time"].append(int(sim_state_mobil.last_has_any_lateral_contact_time))
 
                     meters_in_current_zone = np.clip(
                         (sim_state_position - zone_transitions[current_zone_idx - 1]).dot(
@@ -536,8 +654,26 @@ class GameInstanceManager:
                         self.iface.give_up()
                         give_up_signal_has_been_sent = True
                     elif not give_up_signal_has_been_sent:
-                        self.iface.rewind_to_state(self.start_states[map_path])
-                        _time = 0
+                        start_state = self.start_states[map_path]
+                        if exploring_starts and random.random() < getattr(config_copy, "exploring_starts_prob", 0.0):
+                            picked = self._pick_exploring_start(map_path)
+                            if picked is not None:
+                                start_state, exploring_start_zone = picked
+                        self.iface.rewind_to_state(start_state)
+                        if exploring_start_zone is not None:
+                            # rewind_to_state restores the whole simulation, race_time included, so
+                            # _time jumps to the middle of the lap on the next step. The no-progress
+                            # cutoff below compares _time against last_progress_improvement_ms, and
+                            # current_zone_idx only walks one zone per update -- leave either at its
+                            # start-line value and the rollout is killed on its first step with the
+                            # car hundreds of zones ahead of where the code thinks it is.
+                            _time = start_state.race_time
+                            last_progress_improvement_ms = _time
+                            current_zone_idx = exploring_start_zone
+                            rollout_results["furthest_zone_idx"] = exploring_start_zone
+                            rollout_results["exploring_start_zone"] = exploring_start_zone
+                        else:
+                            _time = 0
                         give_up_signal_has_been_sent = True
                         this_rollout_has_seen_t_negative = True
                     elif (
@@ -546,6 +682,16 @@ class GameInstanceManager:
                         and not this_rollout_is_finished
                     ):
                         # FAILED TO FINISH IN TIME
+                        # Remember the section it died in, so exploring starts are drawn more often
+                        # from the parts of the track it cannot get through. Old failures decay, or
+                        # a section the agent has since mastered would keep attracting starts.
+                        if n_start_buckets > 0:
+                            decay = getattr(config_copy, "exploring_starts_failure_decay", 0.98)
+                            for k in self.zone_failures:
+                                self.zone_failures[k] *= decay
+                            died = min(int(current_zone_idx * n_start_buckets / n_zones_total), n_start_buckets - 1)
+                            self.zone_failures[died] = self.zone_failures.get(died, 0.0) + 1.0
+
                         simulation_state = self.iface.get_simulation_state()
                         race_time = max([simulation_state.race_time, 1e-12])  # Epsilon trick to avoid division by zero
 
@@ -666,6 +812,17 @@ class GameInstanceManager:
                             rollout_results["current_zone_idx"].append(
                                 len(zone_centers) - config_copy.n_zone_centers_extrapolate_after_end_of_map
                             )
+                            # Keep the contact arrays the same length as current_zone_idx. This
+                            # finish-line append is why a finished lap has one more frame than
+                            # state_float, and why every state_float read in the reward loop is
+                            # guarded; the contact arrays are consumed the same way, so they are
+                            # padded here rather than left to desync only on laps that finish.
+                            rollout_results["has_lateral_contact"].append(
+                                rollout_results["has_lateral_contact"][-1] if rollout_results["has_lateral_contact"] else False
+                            )
+                            rollout_results["last_contact_time"].append(
+                                rollout_results["last_contact_time"][-1] if rollout_results["last_contact_time"] else 0
+                            )
                             rollout_results["frames"].append(np.nan)
                             rollout_results["input_w"].append(np.nan)
                             rollout_results["actions"].append(np.nan)
@@ -769,5 +926,10 @@ class GameInstanceManager:
             end_race_stats["tmi_protection_cutoff"] = True
             self.last_rollout_crashed = True
             ensure_not_minimized(self.tm_window_id)
+
+        # A lap rewound to the middle of the track finishes with a plausible-looking absolute
+        # race_time that the policy did not actually drive end to end. Tag it so the learner's
+        # best-run bookkeeping and the pace reference both skip it.
+        end_race_stats["exploring_start"] = exploring_start_zone is not None
 
         return rollout_results, end_race_stats

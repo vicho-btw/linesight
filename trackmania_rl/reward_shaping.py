@@ -3,7 +3,7 @@ Utility functions for reward shaping.
 """
 
 import numpy as np
-from numba import jit
+from trackmania_rl.numba_compat import jit
 
 
 # largely inspired from https://github.com/TomashuTTTT7/TM-AlgoCrack/blob/main/cracks/speedslide_quality.py, yet also largely simplified

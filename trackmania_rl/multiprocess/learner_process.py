@@ -9,7 +9,7 @@ import random
 import sys
 import time
 import typing
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 from multiprocessing.connection import wait
 from pathlib import Path
@@ -121,6 +121,7 @@ def learner_process_fn(
     accumulated_stats: defaultdict[str, typing.Any] = defaultdict(int)
     accumulated_stats["alltime_min_ms"] = {}
     accumulated_stats["rolling_mean_ms"] = {}
+    eval_lap_window = defaultdict(lambda: deque(maxlen=config_copy.checkpoint_eval_window))
     previous_alltime_min = None
     time_last_save = time.perf_counter()
     queue_check_order = list(range(len(rollout_queues)))
@@ -388,10 +389,53 @@ def learner_process_fn(
             )
 
         # ===============================================
+        #   PROMOTE A CHECKPOINT IF THE POLICY IS REALLY BETTER
+        # ===============================================
+        # Every eval lap enters the window, including the ones that did not finish -- those count
+        # at the cutoff, so a policy that crashes early cannot be promoted on a lucky lap.
+        if (not is_explo) and not end_race_stats.get("exploring_start", False):
+            eval_lap_window[map_name].append(
+                end_race_stats["race_time"]
+                if end_race_stats["race_finished"]
+                else config_copy.cutoff_rollout_if_race_not_finished_within_duration_ms
+            )
+            window = eval_lap_window[map_name]
+            if len(window) == window.maxlen:
+                median_ms = float(np.median(window))
+                incumbent = accumulated_stats.setdefault("best_verified_median_ms", {}).get(map_name)
+                n_finished = sum(1 for t in window if t < config_copy.cutoff_rollout_if_race_not_finished_within_duration_ms)
+                tensorboard_writer.add_scalar(
+                    tag=f"eval_median_{window.maxlen}lap_{map_name}",
+                    scalar_value=median_ms / 1000,
+                    global_step=accumulated_stats["cumul_number_frames_played"],
+                    walltime=time.time(),
+                )
+                if incumbent is None or median_ms < incumbent - config_copy.checkpoint_promote_margin_ms:
+                    accumulated_stats["best_verified_median_ms"][map_name] = median_ms
+                    # CANDIDATE, not a verified best. The median describes the ~1200 batches of
+                    # policies that drove the window, while these weights are the network at the
+                    # END of it; when a run is degrading the median still looks good and the
+                    # snapshot is already bad. That is how a regression was once saved as a best
+                    # and the KL anchor dragged onto it. So: write it, name it honestly, and let
+                    # a human decide after driving it -- eval_agent.py over several laps.
+                    tag = f"candidate_{median_ms / 1000:.3f}s".replace(".", "_")
+                    dest = base_dir / "save" / "checkpoints" / f"{tag}_{accumulated_stats['cumul_number_frames_played']}"
+                    utilities.save_checkpoint(dest, online_network, target_network, optimizer1, scaler)
+                    print(
+                        f"candidate saved: window median {median_ms / 1000:.3f}s over {window.maxlen} eval laps "
+                        f"({n_finished} finished){'' if incumbent is None else f', was {incumbent / 1000:.3f}s'} "
+                        f"-> {dest.name}  [NOT promoted, anchor unchanged -- verify by driving it]",
+                        flush=True,
+                    )
+                    window.clear()  # the next decision needs laps driven by later weights
+
+        # ===============================================
         #   SAVE STUFF IF THIS WAS A GOOD RACE
         # ===============================================
 
-        if end_race_stats["race_time"] < accumulated_stats["alltime_min_ms"].get(map_name, 99999999999):
+        if not end_race_stats.get("exploring_start", False) and end_race_stats["race_time"] < accumulated_stats[
+            "alltime_min_ms"
+        ].get(map_name, 99999999999):
             # This is a new alltime_minimum
             accumulated_stats["alltime_min_ms"][map_name] = end_race_stats["race_time"]
             if accumulated_stats["cumul_number_frames_played"] > config_copy.frames_before_save_best_runs:
@@ -411,7 +455,7 @@ def learner_process_fn(
                     scaler,
                 )
 
-        if end_race_stats["race_time"] < config_copy.threshold_to_save_all_runs_ms:
+        if not end_race_stats.get("exploring_start", False) and end_race_stats["race_time"] < config_copy.threshold_to_save_all_runs_ms:
             race_time_ms = end_race_stats["race_time"]
             name = f"{map_name}_{race_time_ms // 1000}_{race_time_ms % 1000:03d}_{datetime.now().strftime('%m%d_%H%M%S')}_{accumulated_stats['cumul_number_frames_played']}_{'explo' if is_explo else 'eval'}"
             utilities.save_run(
@@ -619,7 +663,10 @@ def learner_process_fn(
                     }
                 )
             for key, value in accumulated_stats.items():
-                if key not in ["alltime_min_ms", "rolling_mean_ms"]:
+                # Per-map tables are dicts and are expanded separately; handing one to
+                # add_scalar raises NotImplementedError and kills the learner. Skip by TYPE
+                # rather than by name, so adding another per-map stat cannot repeat that.
+                if key not in ["alltime_min_ms", "rolling_mean_ms"] and not isinstance(value, dict):
                     step_stats[key] = value
             for key, value in accumulated_stats["alltime_min_ms"].items():
                 step_stats[f"alltime_min_ms_{map_name}"] = value

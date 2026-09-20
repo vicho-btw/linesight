@@ -6,9 +6,10 @@ It reassembles the rollout_results object into transitions, as defined in /track
 
 import math
 import random
+from pathlib import Path
 
 import numpy as np
-from numba import jit
+from trackmania_rl.numba_compat import jit
 from torchrl.data import ReplayBuffer
 
 from config_files import config_copy
@@ -29,6 +30,90 @@ def get_potential(state_float):
             min(config_copy.shaped_reward_max_dist_to_cur_vcp, np.linalg.norm(state_float[62:65])),
         )
     ) + (config_copy.shaped_reward_point_to_vcp_ahead * (vector_vcp_to_vcp_further_ahead_normalized[2] - 1))
+
+
+
+
+# ---------------------------------------------------------------------- pace reference
+# Cached so every rollout does not re-read the file; refreshed when it changes on disk.
+_pace_cache = {"path": None, "mtime": 0.0, "table": None}
+
+
+def _pace_reference_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "save" / config_copy.run_name / "reference_pace.npy"
+
+
+def get_pace_reference():
+    """Race time in ms at which the best lap so far reached each virtual checkpoint."""
+    path = _pace_reference_path()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    if _pace_cache["table"] is None or _pace_cache["path"] != path or mtime > _pace_cache["mtime"]:
+        try:
+            _pace_cache["table"] = np.load(path)
+            _pace_cache["path"] = path
+            _pace_cache["mtime"] = mtime
+        except Exception:
+            return None
+    return _pace_cache["table"]
+
+
+def update_pace_reference(rollout_results) -> bool:
+    """If this lap finished and beat the reference, it becomes the new reference."""
+    if "race_time" not in rollout_results:
+        return False
+    if "exploring_start_zone" in rollout_results:
+        # This lap was rewound to the middle of the track, so its race_time covers a stretch the
+        # policy never drove. Taking it as the reference would invent a pace nothing can match.
+        return False
+    zones = rollout_results["current_zone_idx"]
+    n = len(rollout_results["frames"])
+    if n < 2:
+        return False
+    try:
+        max_zone = int(max(z for z in zones[:n] if isinstance(z, (int, np.integer))))
+    except ValueError:
+        return False
+
+    current = get_pace_reference()
+    race_time = rollout_results["race_time"]
+    if current is not None and max_zone < len(current) - 1:
+        return False  # did not get as far as the reference
+    if current is not None:
+        prev_total = float(current[min(max_zone, len(current) - 1)])
+        if race_time > prev_total - config_copy.pace_reference_min_improvement_ms:
+            return False
+
+    # First arrival time at each zone, forward-filled so every index is defined.
+    table = np.full(max_zone + 1, np.inf, dtype=np.float64)
+    for i in range(n):
+        z = zones[i]
+        if not isinstance(z, (int, np.integer)) or z < 0 or z > max_zone:
+            continue
+        t = i * config_copy.ms_per_action
+        if t < table[z]:
+            table[z] = t
+    last = 0.0
+    for z in range(len(table)):
+        if not np.isfinite(table[z]):
+            table[z] = last
+        else:
+            last = table[z]
+    path = _pace_reference_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # np.save appends .npy to any name that lacks it, so the temp file must already
+        # end in .npy or the atomic replace below silently has nothing to rename.
+        tmp = path.with_name(path.stem + ".tmp.npy")
+        np.save(tmp, table)
+        tmp.replace(path)
+        print(f"pace reference advanced: {race_time / 1000:.3f}s over {len(table):,} checkpoints", flush=True)
+        return True
+    except OSError as e:
+        print(f"could not write pace reference: {e}", flush=True)
+        return False
 
 
 def fill_buffer_from_rollout_with_n_steps_rule(
@@ -56,6 +141,9 @@ def fill_buffer_from_rollout_with_n_steps_rule(
         np.float32
     )  # Discount factor that will be placed in front of next_step in Bellman equation, depending on n_steps chosen
 
+    pace_ref = get_pace_reference()
+    update_pace_reference(rollout_results)
+
     reward_into = np.zeros(n_frames)
     for i in range(1, n_frames):
         reward_into[i] += config_copy.constant_reward_per_ms * (
@@ -66,6 +154,43 @@ def fill_buffer_from_rollout_with_n_steps_rule(
         reward_into[i] += (
             rollout_results["meters_advanced_along_centerline"][i] - rollout_results["meters_advanced_along_centerline"][i - 1]
         ) * config_copy.reward_per_m_advanced_along_centerline
+
+        # Crash penalty: a single-step speed loss larger than hard braking can produce.
+        # The implicit cost of a wall hit (fewer metres advanced over the following seconds)
+        # is real but diffuse, and has to travel back through bootstrapping to reach the turn
+        # that caused it. This puts an unambiguous cost on the action itself.
+        # Pace shaping: time gained on the best lap so far over this step. A potential
+        # difference, so it cannot change the optimal policy -- only how quickly the agent
+        # discovers where it is losing time.
+        pace_coef = getattr(config_copy, "pace_shaping_coef", 0.0)
+        if pace_coef != 0.0 and pace_ref is not None:
+            z_now, z_prev = rollout_results["current_zone_idx"][i], rollout_results["current_zone_idx"][i - 1]
+            if isinstance(z_now, (int, np.integer)) and isinstance(z_prev, (int, np.integer)):
+                zn = min(max(int(z_now), 0), len(pace_ref) - 1)
+                zp = min(max(int(z_prev), 0), len(pace_ref) - 1)
+                reward_into[i] += pace_coef * ((pace_ref[zn] - pace_ref[zp]) - config_copy.ms_per_action)
+
+        crash_coef = getattr(config_copy, "crash_penalty_per_m_per_s", 0.0)
+        # On a lap that FINISHES, rollout() appends one extra entry to frames and
+        # current_zone_idx at the finish line but not to state_float, so state_float is one
+        # short; on a lap that does not finish they are equal. That is why every state_float
+        # access here is guarded, and skipping the final step costs nothing either way.
+        if crash_coef != 0.0 and i < n_frames - 1:
+            # Only speed the agent did not ASK to lose. Actions 6-11 all press brake, and
+            # hard braking sheds up to ~5 m/s per step legitimately; counting that would teach
+            # the car not to brake into corners. Even with braking exempt, the 54.370 teacher
+            # still trips a 2.5 m/s threshold ~5 times a lap -- brushing walls is part of the
+            # fast line here -- so the threshold is set above the teacher's p99.9 (4.85 m/s)
+            # to catch only impacts that actually end runs.
+            prev_action = rollout_results["actions"][i - 1] if i - 1 < len(rollout_results["actions"]) else 0
+            was_braking = isinstance(prev_action, (int, np.integer)) and prev_action >= 6
+            if not was_braking:
+                speed_now = np.linalg.norm(rollout_results["state_float"][i][56:59])
+                speed_prev = np.linalg.norm(rollout_results["state_float"][i - 1][56:59])
+                lost = speed_prev - speed_now
+                threshold = getattr(config_copy, "crash_penalty_threshold_m_per_s", 5.0)
+                if lost > threshold:
+                    reward_into[i] -= crash_coef * (lost - threshold)
         if i < n_frames - 1:
             if config_copy.final_speed_reward_per_m_per_s != 0 and rollout_results["state_float"][i][58] > 0:
                 # car has velocity *forward*

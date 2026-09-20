@@ -37,3 +37,16 @@ config_files/config_copy.py
 /config_files/user_config_pb_linux.py
 pixi.lock
 
+
+# FlyWire connectome data (downloaded, see scripts/tools/flywire/README_flywire.md)
+/data/flywire/*
+/logs/*
+!/logs/.gitkeep
+
+# Captured training data and lap recordings: regenerable from replays via
+# scripts/tools/flywire/ (replay_to_actions -> drive_replay --capture), and far
+# too large for git (a single DAgger shard is 400 MB).
+/data/*_bc/
+/data/*_dagger/
+/data/distill/
+/data/lap_capture/
